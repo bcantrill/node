@@ -113,9 +113,7 @@ static Persistent<String> listeners_symbol;
 static Persistent<String> uncaught_exception_symbol;
 static Persistent<String> emit_symbol;
 
-static Persistent<String> enter_symbol;
-static Persistent<String> exit_symbol;
-static Persistent<String> disposed_symbol;
+static Persistent<Function> process_makeCallback;
 
 
 static bool print_eval = false;
@@ -131,8 +129,6 @@ static int max_stack_size = 0;
 // used by C++ modules as well
 bool no_deprecation = false;
 
-static uv_check_t check_tick_watcher;
-static uv_prepare_t prepare_tick_watcher;
 static uv_idle_t tick_spinner;
 static bool need_tick_cb;
 static Persistent<String> tick_callback_sym;
@@ -249,7 +245,9 @@ static void Tick(void) {
 
   TryCatch try_catch;
 
-  cb->Call(process, 0, NULL);
+  // Let the tick callback know that this is coming from the spinner
+  Handle<Value> argv[] = { True() };
+  cb->Call(process, ARRAY_SIZE(argv), argv);
 
   if (try_catch.HasCaught()) {
     FatalException(try_catch);
@@ -263,6 +261,7 @@ static void Spin(uv_idle_t* handle, int status) {
   Tick();
 }
 
+
 static void StartTickSpinner() {
   need_tick_cb = true;
   // TODO: this tick_spinner shouldn't be necessary. An ev_prepare should be
@@ -273,23 +272,12 @@ static void StartTickSpinner() {
   uv_idle_start(&tick_spinner, Spin);
 }
 
+
 static Handle<Value> NeedTickCallback(const Arguments& args) {
   StartTickSpinner();
   return Undefined();
 }
 
-static void PrepareTick(uv_prepare_t* handle, int status) {
-  assert(handle == &prepare_tick_watcher);
-  assert(status == 0);
-  Tick();
-}
-
-
-static void CheckTick(uv_check_t* handle, int status) {
-  assert(handle == &check_tick_watcher);
-  assert(status == 0);
-  Tick();
-}
 
 static inline const char *errno_string(int errorno) {
 #define ERRNO_CASE(e)  case e: return #e;
@@ -1010,42 +998,27 @@ MakeCallback(const Handle<Object> object,
 
   TryCatch try_catch;
 
-  if (enter_symbol.IsEmpty()) {
-    enter_symbol = NODE_PSYMBOL("enter");
-    exit_symbol = NODE_PSYMBOL("exit");
-    disposed_symbol = NODE_PSYMBOL("_disposed");
-  }
-
-  Local<Value> domain_v = object->Get(domain_symbol);
-  Local<Object> domain;
-  Local<Function> enter;
-  Local<Function> exit;
-  if (!domain_v->IsUndefined()) {
-    domain = domain_v->ToObject();
-    if (domain->Get(disposed_symbol)->BooleanValue()) {
-      // domain has been disposed of.
-      return Undefined();
+  if (process_makeCallback.IsEmpty()) {
+    Local<Value> cb_v = process->Get(String::New("_makeCallback"));
+    if (!cb_v->IsFunction()) {
+      fprintf(stderr, "process._makeCallback assigned to non-function\n");
+      abort();
     }
-    enter = Local<Function>::Cast(domain->Get(enter_symbol));
-    enter->Call(domain, 0, NULL);
+    Local<Function> cb = cb_v.As<Function>();
+    process_makeCallback = Persistent<Function>::New(cb);
   }
 
-  if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-    return Undefined();
+  Local<Array> argArray = Array::New(argc);
+  for (int i = 0; i < argc; i++) {
+    argArray->Set(Integer::New(i), argv[i]);
   }
 
-  Local<Value> ret = callback->Call(object, argc, argv);
+  Local<Value> object_l = Local<Value>::New(object);
+  Local<Value> callback_l = Local<Value>::New(callback);
 
-  if (try_catch.HasCaught()) {
-    FatalException(try_catch);
-    return Undefined();
-  }
+  Local<Value> args[3] = { object_l, callback_l, argArray };
 
-  if (!domain_v->IsUndefined()) {
-    exit = Local<Function>::Cast(domain->Get(exit_symbol));
-    exit->Call(domain, 0, NULL);
-  }
+  Local<Value> ret = process_makeCallback->Call(process, ARRAY_SIZE(args), args);
 
   if (try_catch.HasCaught()) {
     FatalException(try_catch);
@@ -1717,7 +1690,6 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
   HandleScope scope;
   char symbol[1024], *base, *pos;
   uv_lib_t lib;
-  node_module_struct compat_mod;
   int r;
 
   if (args.Length() < 2) {
@@ -1771,27 +1743,20 @@ Handle<Value> DLOpen(const v8::Arguments& args) {
     return ThrowException(exception);
   }
 
-  // Get the init() function from the dynamically shared object.
   node_module_struct *mod;
   if (uv_dlsym(&lib, symbol, reinterpret_cast<void**>(&mod))) {
-    /* Start Compatibility hack: Remove once everyone is using NODE_MODULE macro */
-    memset(&compat_mod, 0, sizeof compat_mod);
-
-    mod = &compat_mod;
-    mod->version = NODE_MODULE_VERSION;
-
-    if (uv_dlsym(&lib, "init", reinterpret_cast<void**>(&mod->register_func))) {
-      Local<String> errmsg = String::New(uv_dlerror(&lib));
-      uv_dlclose(&lib);
-      return ThrowException(Exception::Error(errmsg));
-    }
-    /* End Compatibility hack */
+    char errmsg[1024];
+    snprintf(errmsg, sizeof(errmsg), "Symbol %s not found.", symbol);
+    return ThrowError(errmsg);
   }
 
   if (mod->version != NODE_MODULE_VERSION) {
-    Local<Value> exception = Exception::Error(
-        String::New("Module version mismatch, refusing to load."));
-    return ThrowException(exception);
+    char errmsg[1024];
+    snprintf(errmsg,
+             sizeof(errmsg),
+             "Module version mismatch. Expected %d, got %d.",
+             NODE_MODULE_VERSION, mod->version);
+    return ThrowError(errmsg);
   }
 
   // Execute the C++ module
@@ -1858,9 +1823,6 @@ void FatalException(TryCatch &try_catch) {
     ReportException(event_try_catch, true);
     exit(1);
   }
-
-  // This makes sure uncaught exceptions don't interfere with process.nextTick
-  StartTickSpinner();
 }
 
 
@@ -1964,8 +1926,8 @@ static Handle<Value> EnvGetter(Local<String> property,
     return scope.Close(String::New(reinterpret_cast<uint16_t*>(buffer), result));
   }
 #endif
-  // Not found
-  return Undefined();
+  // Not found.  Fetch from prototype.
+  return scope.Close(info.Data().As<Object>()->Get(property));
 }
 
 
@@ -2215,7 +2177,7 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
                                        EnvQuery,
                                        EnvDeleter,
                                        EnvEnumerator,
-                                       Undefined());
+                                       Object::New());
   Local<Object> env = envTemplate->NewInstance();
   process->Set(String::NewSymbol("env"), env);
 
@@ -2781,14 +2743,6 @@ char** Init(int argc, char *argv[]) {
   RegisterSignalHandler(SIGINT, SignalExit);
   RegisterSignalHandler(SIGTERM, SignalExit);
 #endif // __POSIX__
-
-  uv_prepare_init(uv_default_loop(), &prepare_tick_watcher);
-  uv_prepare_start(&prepare_tick_watcher, PrepareTick);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&prepare_tick_watcher));
-
-  uv_check_init(uv_default_loop(), &check_tick_watcher);
-  uv_check_start(&check_tick_watcher, node::CheckTick);
-  uv_unref(reinterpret_cast<uv_handle_t*>(&check_tick_watcher));
 
   uv_idle_init(uv_default_loop(), &tick_spinner);
 

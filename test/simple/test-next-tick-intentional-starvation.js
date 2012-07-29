@@ -20,31 +20,45 @@
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 var common = require('../common');
-var assert = require('assert'),
-    zlib = require('zlib'),
-    started = 0,
-    done = 0;
+var assert = require('assert');
 
-function repeat(fn) {
-  if (started != 0) {
-    assert.ok(started - done < 200);
+// this is the inverse of test-next-tick-starvation.
+// it verifies that process.nextTick will *always* come before other
+// events, up to the limit of the process.maxTickDepth value.
+
+// WARNING: unsafe!
+process.maxTickDepth = Infinity;
+
+var ran = false;
+var starved = false;
+var start = +new Date();
+var timerRan = false;
+
+function spin() {
+  ran = true;
+  var now = +new Date();
+  if (now - start > 100) {
+    console.log('The timer is starving, just as we planned.');
+    starved = true;
+
+    // now let it out.
+    return;
   }
 
-  process.nextTick(function() {
-    fn();
-    repeat(fn);
-  });
+  process.nextTick(spin);
 }
 
-repeat(function() {
-  if (started > 1000) return process.exit(0);
+function onTimeout() {
+  if (!starved) throw new Error('The timer escaped!');
+  console.log('The timer ran once the ban was lifted');
+  timerRan = true;
+}
 
-  for (var i = 0; i < 30; i++) {
-    started++;
-    var deflate = zlib.createDeflate();
-    deflate.write('123');
-    deflate.flush(function() {
-      done++;
-    });
-  }
+spin();
+setTimeout(onTimeout, 50);
+
+process.on('exit', function() {
+  assert.ok(ran);
+  assert.ok(starved);
+  assert.ok(timerRan);
 });
